@@ -19,7 +19,6 @@ This project compares two videos at a time. After chunking, that's usually a few
 
 FAISS is free, runs locally, and requires almost no setup. Adding Pinecone would mean another service to manage, network latency, and usage limits, for no real benefit at this scale.
 
-The tradeoff is that the index gets rebuilt every time new videos are processed. That's fine for a demo. For production I'd move to Qdrant or pgvector.
 
 ### Why BAAI/bge-small-en-v1.5?
 
