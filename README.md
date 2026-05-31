@@ -1,119 +1,180 @@
 # RAG Video Analyzer
 
-I built this for a technical screening.
+Built this for a technical screening. The task was to compare a YouTube video and an Instagram Reel using RAG — paste two URLs, extract content from both, store it in a vector database, and let users ask questions that compare the two creators.
 
-The goal was to compare a YouTube video and an Instagram Reel using RAG. A user pastes two URLs, the system extracts content from both videos, stores it in a vector store, and allows questions that compare the two creators.
+Things like:
+- What do both creators agree on?
+- Which one is more positive about this topic?
+- Why might one video have gotten more engagement?
 
-Some example questions:
+The AI part was honestly the easiest part. Most of my time went into transcript extraction, cloud IP blocks, CORS issues, and cookie handling. More on that below.
 
-* What are the main differences between these creators?
-* Where do they agree?
-* Which creator is more positive about a topic?
-* Why might one video have received more engagement?
+---
 
-The backend is built with FastAPI and LangChain. For retrieval I used FAISS, BM25, and BGE embeddings. Responses are generated using LLaMA 3.3 70B through Groq.
+## Technology Decisions
 
-## Why FAISS?
+### Why FAISS and not Pinecone or Weaviate?
 
-Honestly, because this project only compares two videos at a time.
+This project compares two videos at a time. After chunking, that's usually a few dozen chunks in memory — nowhere near enough to justify spinning up a managed vector database.
 
-After chunking, there are usually only a few dozen chunks in memory. Running Pinecone or Weaviate for that felt unnecessary.
+FAISS is free, runs locally, and requires almost no setup. Adding Pinecone would mean another service to manage, network latency, and usage limits, for no real benefit at this scale.
 
-FAISS is free, local, and takes almost no effort to set up.
+The tradeoff is that the index gets rebuilt every time new videos are processed. That's fine for a demo. For production I'd move to Qdrant or pgvector.
 
-The downside is that the index gets rebuilt whenever new videos are processed. That's fine for a demo project but probably not something I'd keep if this had real traffic.
+### Why BAAI/bge-small-en-v1.5?
 
-If I were building this for production I'd probably move to Qdrant or pgvector.
+I tested a few options. I wanted something free, lightweight, CPU-friendly, and decent at retrieval. BGE Small hit that balance well. Larger embedding models improved retrieval slightly but cost more in latency and memory. Not worth it for a screening project.
 
-## Why chunk size 500 with overlap 50?
+### Why chunk_size=500 with overlap=50?
 
-This came from trial and error.
+Trial and error. Not a magic number.
 
-I first tried smaller chunks and retrieval became too fragmented. A lot of context was lost because sentences and ideas were being split apart.
+- **256 characters** — retrieval was precise but context kept getting lost. Sentences split in weird places, answers felt fragmented.
+- **1000 characters** — chunks started containing multiple unrelated ideas. Retrieval got noisy.
+- **500 characters** — felt like the right balance. The 50-character overlap helped prevent information falling between chunks.
 
-Then I tried larger chunks. Context improved, but retrieval quality got worse because chunks started containing multiple unrelated ideas.
+For longer videos (10+ minutes) I'd probably revisit this and test hierarchical chunking.
 
-500 with a small overlap ended up being the best balance for the videos I tested.
+### Why hybrid retrieval (MMR + BM25)?
 
-It's not a magic number. It's just what worked best after a few experiments.
+Started with semantic search only. It worked well most of the time, but occasionally missed creator names, exact numbers, specific hashtags, and quoted phrases. Dense retrieval just isn't built for exact matches.
 
-## Why hybrid retrieval?
+Adding BM25 fixed that. Using both together was noticeably better than either one alone.
 
-I started with vector search only.
+MMR helped too — without it, retrieval kept returning four chunks that were basically identical. That's useless.
 
-Most of the time it worked well, but it occasionally missed things like creator names, exact phrases, hashtags, and numbers.
+### Why Groq + Llama 3.3 70B?
 
-BM25 was better at those exact matches.
+Speed, and it's free. Groq is noticeably faster than most free inference options, which matters for a chat interface where users are waiting on responses.
 
-Using both together gave better results than either one by itself.
+GPT-4o would probably give more consistent reasoning. If I were building this commercially I'd benchmark GPT-4o, Claude Sonnet, and Llama side by side and make a decision based on quality versus cost. For this project, free and fast won.
 
-MMR also helped avoid getting four nearly identical chunks back from retrieval.
+### Why faster-whisper?
 
-## What gave me the most trouble?
+Instagram doesn't provide transcripts the way YouTube does, so audio has to be transcribed locally. I compared OpenAI's Whisper and faster-whisper. faster-whisper was significantly faster on CPU with similar output quality. Easy choice.
 
-Instagram and YouTube.
+---
 
-Instagram extraction worked with yt-dlp, but some requests failed until I started passing browser cookies. Once cookies were added things became much more reliable.
+## Problems I Actually Ran Into
 
-YouTube was even more frustrating.
+### Instagram blocking requests
 
-Locally everything worked. Transcript extraction, embeddings, retrieval, all fine.
+Getting Instagram content to work reliably was the most frustrating part of the project. yt-dlp can pull reel data, but Instagram blocks a lot of unauthenticated requests. I had to export browser cookies and pass them into yt-dlp before things became consistent. Without cookies, a lot of reels just silently failed.
 
-After deploying to Railway, transcript extraction immediately started failing.
+### Whisper latency
 
-The logs showed:
+A 60-second reel takes roughly 40–50 seconds to transcribe on CPU. For a demo, that's tolerable. For anything with real users, it would need to move into background workers immediately.
 
+### Railway blocking YouTube transcripts
+
+This was the biggest deployment issue.
+
+Everything worked locally. Transcript extraction, embeddings, retrieval — all fine. After deploying to Railway, YouTube transcript extraction started failing immediately. The error was:
 youtube_transcript_api._errors.IpBlocked
+I spent a while assuming I'd broken something. Eventually figured out that YouTube blocks cloud provider IP ranges. The exact same code that ran fine on my laptop was hitting a wall from Railway's infrastructure. It wasn't a bug. It was a hosting problem I had no control over.
 
-At first I assumed I'd broken something.
+If I keep working on this, I'd stop depending on youtube-transcript-api entirely and generate transcripts with Whisper instead.
 
-After a lot of debugging I found out YouTube blocks many cloud provider IPs. The exact same code worked on my laptop but failed from Railway.
+### yt-dlp on hosted environments
 
-That ended up being the biggest deployment issue in the project.
+Even separate from the YouTube issue, yt-dlp behaved differently in hosted environments. Cookie handling, rate limits, and authentication all worked differently than local development. Deployment revealed a lot of edge cases I hadn't encountered locally.
 
-If I continue working on this, I'd probably stop depending on youtube-transcript-api and generate transcripts directly with Whisper instead.
+### CORS
 
-## What breaks at 10,000 users?
+The frontend was making requests to the FastAPI backend and getting blocked by the browser before the response ever made it through. The actual backend response was fine — but the browser's CORS error was hiding that. Took longer to debug than it should have because the real error wasn't visible until I bypassed the browser entirely.
 
-The first thing that breaks is transcription.
+---
 
-Right now everything runs synchronously. If lots of users start uploading videos, requests will spend most of their time waiting for transcription jobs to finish.
+## What Breaks at 10,000 Users
 
-The second issue is FAISS. Rebuilding indexes is fine for demos but not for large-scale usage.
+### Synchronous transcription
 
-The third issue is Instagram extraction. Cookie-based approaches work but they're not something I'd trust long-term.
+Everything runs in sequence right now. If many users submit videos simultaneously, they all queue up waiting for Whisper to finish. This needs background workers, a job queue (Celery + Redis), and a system that returns a job ID immediately and notifies users when processing is done.
 
-I'd eventually move to:
+### FAISS
 
-* Qdrant or pgvector for storage
-* Background workers for transcription
-* Separate services for extraction and retrieval
+Rebuilding an in-memory index per request doesn't scale. I'd move to Qdrant or pgvector with persistent storage.
+
+### Instagram cookies
+
+Browser cookies expire. A production system would need proper cookie rotation, account management, or a third-party extraction service. The current approach is fine for demos, not for anything at scale.
+
+### YouTube transcript reliability
+
+Cloud IPs getting blocked isn't something I can fix in code. A production version needs proxy infrastructure, fallback audio transcription, or a different approach entirely — probably Whisper as the primary path, with youtube-transcript-api only as a fast path when available.
+
+### Compute
+
+Multiple simultaneous Whisper jobs would hit CPU and memory limits fast. The architecture would need to separate into distinct services — API layer, retrieval service, and transcription workers — and scale each independently.
+
+---
+
+## What This Project Demonstrates
+
+This project is less about "just RAG" and more about real-world system design tradeoffs:
+
+- Data extraction is harder than LLM reasoning
+- Cloud environments break assumptions made locally
+- "Simple demos" expose production bottlenecks fast
+- Retrieval quality depends heavily on chunking and hybrid search, not just embeddings
+
+---
+
+## Honest Limitation Summary
+
+Currently optimized for:
+- Demo-scale workloads
+- Single-user / low concurrency usage
+- Short-lived video comparisons
+
+Not yet production-ready for:
+- High concurrency
+- Stable Instagram scraping at scale
+- Cloud-based YouTube transcript extraction
+
+---
 
 ## Tech Stack
 
-Backend
+**Backend**
+- FastAPI
+- LangChain
+- FAISS
+- BM25 Retriever
+- yt-dlp
+- youtube-transcript-api
+- faster-whisper
 
-* FastAPI
-* LangChain
-* FAISS
-* BM25 Retriever
-* yt-dlp
-* youtube-transcript-api
+**Models**
+- BAAI/bge-small-en-v1.5
+- Llama 3.3 70B via Groq
 
-Models
+**Frontend**
+- Next.js 14
+- React
 
-* BAAI/bge-small-en-v1.5
-* LLaMA 3.3 70B (Groq)
-* faster-whisper
+---
 
-Frontend
+##  Environment Variables
 
-* Next.js 14
-* React
+Create a `.env` file in the `backend` directory:
 
-## Running Locally
+```env
+GROQ_API_KEY=your_groq_api_key_here
+```
 
-Backend
+Optional depending on your setup:
+
+```env
+HF_TOKEN=your_huggingface_token_here   # if using gated models
+REDIS_URL=your_redis_url               # if adding Celery later
+```
+
+---
+
+##  Running Locally
+
+**Backend**
 
 ```bash
 cd backend
@@ -121,18 +182,12 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Frontend
+**Frontend**
 
 ```bash
-cd files
+cd frontend
 npm install
 npm run dev
 ```
 
-## Final Thoughts
-
-The AI part was actually the easiest part of this project.
-
-Most of the time went into dealing with transcript extraction, deployment issues, CORS problems, cloud restrictions, and getting retrieval quality where I wanted it.
-
-The project works, but it also taught me that building around AI models is usually harder than calling the model itself.
+You'll also need a valid `cookies.txt` file if you're testing Instagram reels. Without it, a lot of reels will silently fail.
